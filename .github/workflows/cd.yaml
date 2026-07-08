@@ -1,0 +1,206 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  id-token: write   # necessário para autenticação OIDC com a AWS
+  contents: read
+
+jobs:
+  # ============================================
+  # Job 1: Lint + Testes + SonarCloud Quality Gate
+  # ============================================
+  quality:
+    name: Lint, Tests & Quality Gate
+    runs-on: ubuntu-latest
+
+    services:
+      mariadb:
+        image: mariadb:11
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: nest_db_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # necessário para o SonarCloud analisar histórico corretamente
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma Client
+        run: npx prisma generate
+
+      - name: Lint
+        run: npm run lint:check
+
+      - name: Create .env.test
+        run: |
+          cat <<EOF > .env.test
+          DATABASE_TYPE=mysql
+          DATABASE_HOST=127.0.0.1
+          DATABASE_PORT=3306
+          DATABASE_USER=root
+          DATABASE_PASSWORD=root
+          DATABASE_NAME=nest_db_test
+          DATABASE_URL=mysql://root:root@127.0.0.1:3306/nest_db_test
+          JWT_SECRET=ci-test-secret
+          JWT_ACCESS_EXPIRES_IN=15m
+          JWT_REFRESH_EXPIRES_IN=7d
+          ALLOWED_ORIGINS=http://localhost:5173
+          RATE_LIMIT_REQUESTS=100
+          RATE_LIMIT_SECONDS=60
+          BCRYPT_SALT_ROUNDS=10
+          DATABASE_CONNECTION_LIMIT=5
+          PORT=3000
+          EOF
+
+      - name: Unit tests (with coverage)
+        run: npm run test:cov
+
+      - name: E2E tests
+        run: npm run test:e2e
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarqube-scan-action@v4
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+      - name: SonarCloud Quality Gate
+        uses: SonarSource/sonarqube-quality-gate-action@master
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  # ============================================
+  # Job 2: Build da imagem e push para o ECR
+  # ============================================
+  build-and-push:
+    name: Build & Push to ECR
+    needs: quality
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.vars.outputs.image_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: vars
+        run: echo "image_tag=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.ECR_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        run: |
+          docker build -t ${{ secrets.ECR_REPOSITORY }}:${{ steps.vars.outputs.image_tag }} .
+          docker push ${{ secrets.ECR_REPOSITORY }}:${{ steps.vars.outputs.image_tag }}
+
+  # ============================================
+  # Job 3: Deploy no cluster Kubernetes
+  # ============================================
+  deploy:
+    name: Deploy to Kubernetes
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_TAG: ${{ needs.build-and-push.outputs.image_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.36.0'
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.ECR_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Refresh ECR image pull secret in cluster
+        run: |
+          aws ecr get-login-password --region ${{ secrets.AWS_REGION }} > /tmp/ecr-token
+          kubectl create secret docker-registry ecr-registry-secret \
+            --docker-server=${{ secrets.ECR_REPOSITORY }} \
+            --docker-username=AWS \
+            --docker-password="$(cat /tmp/ecr-token)" \
+            --namespace=default \
+            --dry-run=client -o yaml | kubectl apply -f -
+            
+      - name: Apply Kubernetes secrets
+        run: |
+          sed -e "s/MARIADB_USER_LOGIN_PLACEHOLDER/${{ secrets.MARIADB_USER_LOGIN }}/g" \
+              -e "s/MARIADB_USER_PASSWORD_PLACEHOLDER/${{ secrets.MARIADB_USER_PASSWORD }}/g" \
+              -e "s/MARIADB_DB_NAME_PLACEHOLDER/${{ secrets.MARIADB_DB_NAME }}/g" \
+              -e "s/JWT_SECRET_PLACEHOLDER/${{ secrets.JWT_SECRET }}/g" \
+              -e "s/JWT_ACCESS_EXPIRES_IN_PLACEHOLDER/${{ vars.JWT_ACCESS_EXPIRES_IN }}/g" \
+              -e "s/JWT_REFRESH_EXPIRES_IN_PLACEHOLDER/${{ vars.JWT_REFRESH_EXPIRES_IN }}/g" \
+              -e "s#ALLOWED_ORIGINS_PLACEHOLDER#${{ vars.ALLOWED_ORIGINS }}#g" \
+              -e "s/RATE_LIMIT_REQUESTS_PLACEHOLDER/${{ vars.RATE_LIMIT_REQUESTS }}/g" \
+              -e "s/RATE_LIMIT_SECONDS_PLACEHOLDER/${{ vars.RATE_LIMIT_SECONDS }}/g" \
+              -e "s/BCRYPT_SALT_ROUNDS_PLACEHOLDER/${{ vars.BCRYPT_SALT_ROUNDS }}/g" \
+              -e "s/DATABASE_CONNECTION_LIMIT_PLACEHOLDER/${{ vars.DATABASE_CONNECTION_LIMIT }}/g" \
+              -e "s/PORT_PLACEHOLDER/${{ vars.PORT }}/g" \
+              manifests/secret.yaml | kubectl apply -f -
+
+      - name: Run database migration job
+        run: |
+          sed -e "s/IMAGE_TAG/${{ env.IMAGE_TAG }}/g" \
+              -e "s#ECR_REPOSITORY_PLACEHOLDER#${{ secrets.ECR_REPOSITORY }}#g" \
+              manifests/migration-job.yaml > /tmp/migration-job.yaml
+          kubectl delete job prisma-migrate-${{ env.IMAGE_TAG }} --ignore-not-found=true
+          kubectl apply -f /tmp/migration-job.yaml
+          kubectl wait --for=condition=complete job/prisma-migrate-${{ env.IMAGE_TAG }} --timeout=120s
+
+      - name: Deploy application
+        run: |
+          sed -e "s/IMAGE_TAG/${{ env.IMAGE_TAG }}/g" \
+              -e "s#ECR_REPOSITORY_PLACEHOLDER#${{ secrets.ECR_REPOSITORY }}#g" \
+              -e "s/PORT_PLACEHOLDER/${{ vars.PORT }}/g" \
+              manifests/deployment.yaml > /tmp/deployment.yaml
+          kubectl apply -f /tmp/deployment.yaml
+          kubectl rollout status deployment/nest-api --timeout=120s
+
+      - name: Smoke test
+        run: |
+          sleep 5
+          curl -f https://anest.rdev.eti.br/health || exit 1

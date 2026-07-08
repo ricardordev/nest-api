@@ -1,0 +1,77 @@
+generator client {
+    provider     = "prisma-client"
+    output       = "../src/generated/prisma"
+    moduleFormat = "cjs"
+}
+
+datasource db {
+    provider = "mysql"
+}
+
+model User {
+    id            Int            @id @default(autoincrement())
+    email         String         @unique
+    login         String         @unique
+    password      String
+    transactions  Transaction[]
+    single_datas  SingleData[]
+    refreshTokens RefreshToken[]
+
+    @@map("users")
+}
+
+model RefreshToken {
+    id        String    @id @default(uuid())
+    tokenHash String    @unique
+    lookupKey String?   @map("lookup_key")
+    userId    Int       @map("user_id")
+    family    String
+    expiresAt DateTime  @map("expires_at")
+    revokedAt DateTime? @map("revoked_at")
+    createdAt DateTime  @default(now()) @map("created_at")
+    user      User      @relation(fields: [userId], references: [id])
+
+    @@index([userId], map: "refresh_tokens_user_id_fkey")
+    @@index([family], map: "refresh_tokens_family_idx")
+    @@index([lookupKey], map: "refresh_tokens_lookup_key_idx")
+    @@map("refresh_tokens")
+}
+
+model Transaction {
+    id        Int             @id @default(autoincrement())
+    hash      String          @unique @default(uuid())
+    amount    Decimal         @db.Decimal(12, 2)
+    type      TransactionType
+    userId    Int             @map("user_id")
+    createdAt DateTime        @default(now()) @map("created_at")
+    updatedAt DateTime        @updatedAt @map("updated_at")
+    user      User            @relation(fields: [userId], references: [id])
+
+    @@index([userId], map: "transactions_user_id_fkey")
+    @@map("transactions")
+}
+
+model SingleData {
+    id          Int            @id @default(autoincrement())
+    title       String         @db.VarChar(299)
+    description String         @db.Text
+    amount      Decimal        @db.Decimal(12, 2)
+    type        SingleDataType
+    userId      Int            @map("user_id")
+    createdAt   DateTime       @default(now()) @map("created_at")
+    updatedAt   DateTime       @updatedAt @map("updated_at")
+    user        User           @relation(fields: [userId], references: [id])
+
+    @@index([userId], map: "singledatas_user_id_fkey")
+    @@map("single_data")
+}
+
+enum TransactionType {
+    credit
+    debit
+}
+
+enum SingleDataType {
+    story
+    transaction
+}
